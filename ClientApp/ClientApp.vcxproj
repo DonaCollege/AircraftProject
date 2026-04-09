@@ -123,13 +123,7 @@
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
-    <ClCompile Include="ClientApp.cpp" />
-    <ClCompile Include="ClientSocket.cpp" />
-    <ClCompile Include="PacketBuilder.cpp" />
-    <ClCompile Include="TelemetryReader.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="TelemetryReader.h" />
+    <ClCompile Include="Client.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
