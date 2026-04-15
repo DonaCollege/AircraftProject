@@ -1,4 +1,4 @@
-#pragma once
+﻿/*#pragma once
 
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
@@ -7,6 +7,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -16,10 +17,21 @@
 #include <thread>
 #include <atomic>
 #include <iomanip>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <vector>
+#include <stdexcept>
+#include <algorithm>   // ✅ FIX
+#include <cstdlib>     // ✅ FIX
 
 #pragma comment(lib, "Ws2_32.lib")
 
 constexpr int DEFAULT_PORT = 54000;
+
+// ─────────────────────────────────────────────────────────────
+// Data Structures
+// ─────────────────────────────────────────────────────────────
 
 struct TelemetryPacket
 {
@@ -43,13 +55,52 @@ struct FlightState
     }
 };
 
+struct LogEntry
+{
+    std::string consoleLine;
+    std::string csvLine;
+};
+
+// ─────────────────────────────────────────────────────────────
+// Thread Pool
+// ─────────────────────────────────────────────────────────────
+
+class ThreadPool
+{
+public:
+    explicit ThreadPool(size_t numThreads);
+    ~ThreadPool();
+    void enqueue(std::function<void()> task);
+
+private:
+    std::vector<std::thread>           m_workers;
+    std::queue<std::function<void()>>  m_tasks;
+    std::mutex                         m_taskMutex;
+    std::condition_variable            m_taskCV;
+    bool                               m_stop = false;
+};
+
+// ─────────────────────────────────────────────────────────────
+// Globals
+// ─────────────────────────────────────────────────────────────
+
 extern std::unordered_map<int, FlightState> g_flights;
 extern std::mutex                           g_flightsMutex;
+
 extern std::ofstream                        g_logFile;
-extern std::mutex                           g_logMutex;
+extern std::queue<LogEntry>                 g_logQueue;
+extern std::mutex                           g_logQueueMutex;
+extern std::condition_variable              g_logCV;
+extern std::atomic<bool>                    g_logRunning;
+
+// ─────────────────────────────────────────────────────────────
+// Function Declarations
+// ─────────────────────────────────────────────────────────────
 
 TelemetryPacket ParsePacket(const std::string& line);
 void RegisterFlight(int planeID);
 void UpdateAndLog(int planeID, const TelemetryPacket& pkt);
 void FinalizeFlight(int planeID);
 void ClientHandler(SOCKET clientSocket);
+void EnqueueLog(const std::string& consoleLine, const std::string& csvLine);
+void LogWorker();*/

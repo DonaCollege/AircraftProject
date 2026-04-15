@@ -1,205 +1,160 @@
-﻿#include "Server.h"
+﻿#include <iostream>
+#include <thread>
+#include <vector>
+#include <unordered_map>
+#include <mutex>
+#include <sstream>
+#include <fstream>
+#include <winsock2.h>
+#include <ws2tcpip.h>
 
-// Global definitions
+#pragma comment(lib, "ws2_32.lib")
+
+#define DEFAULT_PORT 54000
+#define BUFFER_SIZE 4096
+
+struct TelemetryPacket {
+    int planeID;
+    int timestamp;      // relative time (for calculation)
+    double fuelRemaining;
+    std::string realTime; // display only
+};
+
+struct FlightState {
+    int planeID;
+    double initialFuel = 0;
+    double currentFuel = 0;
+    int currentTimestamp = 0;
+    bool firstPacket = true;
+
+    double getAvgConsumption() const {
+        if (firstPacket || currentTimestamp == 0) return 0.0;
+        return (initialFuel - currentFuel) / (double)currentTimestamp;
+    }
+};
+
 std::unordered_map<int, FlightState> g_flights;
-std::mutex                           g_flightsMutex;
-std::ofstream                        g_logFile;
-std::mutex                           g_logMutex;
+std::mutex g_mutex;
 
-// ── Packet Parser ─────────────────────────────────────────────
-TelemetryPacket ParsePacket(const std::string& line)
-{
-    TelemetryPacket pkt;
+std::ofstream logFile("flight_log.csv");
+
+// ================= PARSER =================
+bool parsePacket(const std::string& line, TelemetryPacket& pkt) {
     std::istringstream ss(line);
+    std::string timeStr;
     char comma;
-    if (!(ss >> pkt.planeID >> comma >> pkt.timestamp >> comma >> pkt.fuelRemaining))
-        pkt.planeID = -1;
-    return pkt;
+
+    if (!(ss >> pkt.planeID >> comma
+        >> pkt.timestamp >> comma
+        >> pkt.fuelRemaining >> comma
+        >> timeStr))
+        return false;
+
+    pkt.realTime = timeStr;
+    return true;
 }
 
-// ── Flight Manager ────────────────────────────────────────────
-void RegisterFlight(int planeID)
-{
-    std::lock_guard<std::mutex> lk(g_flightsMutex);
-    FlightState fs;
-    fs.planeID = planeID;
-    g_flights[planeID] = fs;
-}
+// ================= FLIGHT MANAGER =================
+void updateFlight(const TelemetryPacket& pkt) {
+    std::lock_guard<std::mutex> lock(g_mutex);
 
-void UpdateAndLog(int planeID, const TelemetryPacket& pkt)
-{
-    double avg = 0.0;
-    {
-        std::lock_guard<std::mutex> lk(g_flightsMutex);
-        auto it = g_flights.find(planeID);
-        if (it == g_flights.end()) return;
+    auto& flight = g_flights[pkt.planeID];
+    flight.planeID = pkt.planeID;
 
-        FlightState& fs = it->second;
-        if (fs.firstPacket) {
-            fs.initialFuel = pkt.fuelRemaining;
-            fs.firstPacket = false;
-        }
-        fs.currentFuel = pkt.fuelRemaining;
-        fs.currentTimestamp = pkt.timestamp;
-        avg = fs.GetAvgConsumption();
+    if (flight.firstPacket) {
+        flight.initialFuel = pkt.fuelRemaining;
+        flight.firstPacket = false;
     }
 
-    std::ostringstream msg;
-    msg << std::fixed << std::setprecision(4)
-        << "Plane " << planeID
-        << " | Time:" << pkt.timestamp
+    flight.currentFuel = pkt.fuelRemaining;
+    flight.currentTimestamp = pkt.timestamp;
+
+    double avg = flight.getAvgConsumption();
+
+    std::cout << "Plane " << pkt.planeID
+        << " | Time:" << pkt.realTime
         << " | Fuel:" << pkt.fuelRemaining
-        << " | Avg Consumption:" << avg << " gal/s";
+        << " | Avg:" << avg << std::endl;
 
-    {
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        std::cout << msg.str() << "\n";
-        if (g_logFile.is_open()) {
-            g_logFile << planeID << "," << pkt.timestamp << ","
-                << pkt.fuelRemaining << "," << avg << "\n";
-            g_logFile.flush();
-        }
+    logFile << pkt.planeID << "," << pkt.timestamp << ","
+        << pkt.fuelRemaining << "," << avg << "\n";
+}
+
+void finalizeFlight(int planeID) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+
+    if (g_flights.find(planeID) != g_flights.end()) {
+        double finalAvg = g_flights[planeID].getAvgConsumption();
+
+        std::cout << "[FLIGHT COMPLETE] Plane " << planeID
+            << " | Final Avg: " << finalAvg << " gal/s\n";
+
+        logFile << "FINAL," << planeID << "," << finalAvg << "\n";
+
+        g_flights.erase(planeID);
     }
 }
 
-void FinalizeFlight(int planeID)
-{
-    double finalAvg = 0.0;
-    {
-        std::lock_guard<std::mutex> lk(g_flightsMutex);
-        auto it = g_flights.find(planeID);
-        if (it == g_flights.end()) return;
-        finalAvg = it->second.GetAvgConsumption();
-        g_flights.erase(it);
-    }
+// ================= CLIENT HANDLER =================
+void handleClient(SOCKET clientSocket) {
+    char buffer[BUFFER_SIZE];
+    std::string dataBuffer;
+    int planeID = -1;
 
-    std::ostringstream msg;
-    msg << std::fixed << std::setprecision(4)
-        << "[FLIGHT COMPLETE] Plane " << planeID
-        << " | Final Avg Consumption: " << finalAvg << " gal/s";
+    while (true) {
+        int bytes = recv(clientSocket, buffer, BUFFER_SIZE, 0);
 
-    {
-        std::lock_guard<std::mutex> lk(g_logMutex);
-        std::cout << msg.str() << "\n";
-        if (g_logFile.is_open()) {
-            g_logFile << planeID << ",FINAL,," << finalAvg << "\n";
-            g_logFile.flush();
+        if (bytes <= 0) {
+            if (planeID != -1)
+                finalizeFlight(planeID);
+            break;
         }
-    }
-}
 
-// ── Client Handler (one per thread) ──────────────────────────
-void ClientHandler(SOCKET clientSocket)
-{
-    std::string buffer;
-    char        chunk[512];
-    int         planeID = -1;
-    bool        registered = false;
-
-    while (true)
-    {
-        int bytesReceived = recv(clientSocket, chunk, sizeof(chunk) - 1, 0);
-        if (bytesReceived <= 0) break;
-
-        chunk[bytesReceived] = '\0';
-        buffer += chunk;
+        dataBuffer.append(buffer, bytes);
 
         size_t pos;
-        while ((pos = buffer.find('\n')) != std::string::npos)
-        {
-            std::string line = buffer.substr(0, pos);
-            buffer.erase(0, pos + 1);
-            if (line.empty()) continue;
+        while ((pos = dataBuffer.find('\n')) != std::string::npos) {
+            std::string line = dataBuffer.substr(0, pos);
+            dataBuffer.erase(0, pos + 1);
 
-            TelemetryPacket pkt = ParsePacket(line);
-            if (pkt.planeID == -1) continue;
-
-            if (!registered)
-            {
+            TelemetryPacket pkt;
+            if (parsePacket(line, pkt)) {
                 planeID = pkt.planeID;
-                RegisterFlight(planeID);
-                registered = true;
-                std::lock_guard<std::mutex> lk(g_logMutex);
-                std::cout << "Client connected: Plane " << planeID << "\n";
+                updateFlight(pkt);
             }
-            UpdateAndLog(planeID, pkt);
         }
     }
 
-    if (registered) FinalizeFlight(planeID);
     closesocket(clientSocket);
 }
 
-// ── main() ───────────────────────────────────────────────────
-int main(int argc, char* argv[])
-{
+// ================= MAIN =================
+int main(int argc, char* argv[]) {
     int port = DEFAULT_PORT;
-    if (argc >= 2)
-    {
-        port = std::atoi(argv[1]);
-        if (port <= 0 || port > 65535) port = DEFAULT_PORT;
-    }
+    if (argc > 1) port = atoi(argv[1]);
 
-    g_logFile.open("flight_log.csv", std::ios::app);
-    if (g_logFile.is_open())
-        g_logFile << "PlaneID,Timestamp,FuelRemaining,AvgConsumption\n";
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
 
-    WSADATA wsaData;
-    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0)
-    {
-        std::cerr << "WSAStartup failed.\n";
-        return 1;
-    }
+    SOCKET serverSocket = socket(AF_INET, SOCK_STREAM, 0);
 
-    SOCKET listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (listenSocket == INVALID_SOCKET)
-    {
-        std::cerr << "socket() failed.\n";
-        WSACleanup();
-        return 1;
-    }
-
-    int opt = 1;
-    setsockopt(listenSocket, SOL_SOCKET, SO_REUSEADDR,
-        reinterpret_cast<char*>(&opt), sizeof(opt));
-
-    sockaddr_in serverAddr{};
+    sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
+    serverAddr.sin_port = htons(port);
     serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(static_cast<u_short>(port));
 
-    if (bind(listenSocket, reinterpret_cast<sockaddr*>(&serverAddr), sizeof(serverAddr)) == SOCKET_ERROR)
-    {
-        std::cerr << "bind() failed: " << WSAGetLastError() << "\n";
-        closesocket(listenSocket); WSACleanup(); return 1;
+    bind(serverSocket, (sockaddr*)&serverAddr, sizeof(serverAddr));
+    listen(serverSocket, SOMAXCONN);
+
+    std::cout << "Server started on port " << port << "\n";
+    std::cout << "Waiting for clients...\n";
+
+    while (true) {
+        SOCKET clientSocket = accept(serverSocket, nullptr, nullptr);
+        std::thread(handleClient, clientSocket).detach();
     }
 
-    if (listen(listenSocket, SOMAXCONN) == SOCKET_ERROR)
-    {
-        std::cerr << "listen() failed.\n";
-        closesocket(listenSocket); WSACleanup(); return 1;
-    }
-
-    std::cout << "Server started\n";
-    std::cout << "Waiting for clients... (port " << port << ")\n";
-
-    while (true)
-    {
-        sockaddr_in clientAddr{};
-        int clientAddrLen = sizeof(clientAddr);
-        SOCKET clientSocket = accept(listenSocket,
-            reinterpret_cast<sockaddr*>(&clientAddr),
-            &clientAddrLen);
-        if (clientSocket == INVALID_SOCKET)
-        {
-            std::cerr << "[WARN] accept() failed - continuing.\n";
-            continue;
-        }
-        std::thread t(ClientHandler, clientSocket);
-        t.detach();
-    }
-
-    closesocket(listenSocket);
+    closesocket(serverSocket);
     WSACleanup();
     return 0;
 }
